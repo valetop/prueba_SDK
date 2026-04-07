@@ -1,0 +1,227 @@
+# ============================================================
+# Template: tms-deploy.yml
+#
+# Este template hace un deploy "completo" al TMS por ambiente usando deployment job con los siguientes pasos:
+#  1) Descarga artefacto app.bin
+#  2) Login → obtiene token (guarda como variable secreta TMS_TOKEN)
+#  3) addApp → sube app.bin (multipart: file + param JSON) y obtiene appId (si el response no lo tiene, se resuelve con queryPageList)
+#  4) queryPageList → encuentra el registro de app subido (id)
+#  5) upAndDownApp → publica (on shelves) / retira según type
+#
+# IMPORTANTE:
+#  - Environment (Azure DevOps) controla aprobaciones (uat y pdn necesitan aprobación manual)
+#  - Token se guarda como variable secreta (no sale en logs)
+# ============================================================
+
+parameters:
+  - name: environmentName
+    type: string
+
+  - name: artifactName
+    type: string
+  - name: appBinName
+    type: string
+
+  - name: tmsBaseUrl
+    type: string
+  - name: loginPath
+    type: string
+  - name: addAppPath
+    type: string
+  - name: queryPath
+    type: string
+  - name: publishPath
+    type: string
+
+  - name: tmsUsername
+    type: string
+  - name: tmsPasswordMd5
+    type: string
+
+  - name: appName
+    type: string
+  - name: modelName
+    type: string
+
+  # Release controls (de OpenAPI / operación):
+  # pushRange: 1=all, 2=device(s), 3=group
+  # otaType: 0=manual, 1=forced
+  # upOrDownType (type): 1=on shelves (publish), 2=removal
+  - name: pushRange
+    type: number
+    default: 1 
+  - name: otaType
+    type: number
+    default: 0
+  - name: upOrDownType
+    type: number
+    default: 1
+
+jobs:
+- deployment: deploy_to_tms
+  displayName: "Deploy → ${{ parameters.environmentName }}"
+  environment: "${{ parameters.environmentName }}"
+  strategy:
+    runOnce:
+      deploy:
+        steps:
+          # 1) Descargar artefacto del stage Build (mismo pipeline)
+          - download: current
+            artifact: "${{ parameters.artifactName }}"
+            displayName: "Download artifact: ${{ parameters.artifactName }}"
+
+          # 2) Login al TMS → obtener token
+          - pwsh: |
+              $ErrorActionPreference = "Stop"
+
+              $loginUrl = "${{ parameters.tmsBaseUrl }}${{ parameters.loginPath }}"
+              Write-Host "Login URL: $loginUrl"
+
+              $bodyObj = @{
+                username = "${{ parameters.tmsUsername }}"
+                password = "${{ parameters.tmsPasswordMd5 }}"
+              }
+              $body = $bodyObj | ConvertTo-Json -Compress
+
+              $resp = Invoke-RestMethod -Method Post -Uri $loginUrl -ContentType "application/json" -Body $body #esta línea hace el POST al endpoint de login del TMS usando las credenciales proporcionadas, y espera recibir una respuesta que contenga un token de autenticación si el login es exitoso. 
+
+              if (-not $resp.token) {
+                throw "Login failed: token not received."
+              }
+
+              # Token se usa en Authorization header en siguientes pasos y se guarda como variable secreta para seguridad
+              Write-Host "##vso[task.setvariable variable=TMS_TOKEN;issecret=true]$($resp.token)"
+              Write-Host " Login OK (token stored as secret variable)" # el token se guarda como variable secreta automaticamente al usar issecret=true en la linea anterior, especificamente se guarda en Azure DevOps como variable de pipeline con el nombre TMS_TOKEN, y al marcarla como secreta, se asegura que su valor no se muestre en los logs ni se exponga accidentalmente, lo cual es crucial para mantener la seguridad de las credenciales de autenticación al interactuar con el TMS.
+            displayName: "TMS login → token"
+
+          # 3) addApp (upload app.bin), este bloque hace el upload del binario de la app al TMS usando el endpoint addApp, que es un multipart/form-data que incluye el archivo (app.bin) y un campo param con un JSON que contiene el appName y modelName. El token obtenido en el paso anterior se usa en el header de Authorization para autenticar la solicitud.
+          - pwsh: |
+              $ErrorActionPreference = "Stop"
+
+              $addUrl = "${{ parameters.tmsBaseUrl }}${{ parameters.addAppPath }}"
+              $binPath = "$(Pipeline.Workspace)\${{ parameters.artifactName }}\${{ parameters.appBinName }}"
+
+              if (-not (Test-Path $binPath)) {
+                throw "Binary not found at: $binPath"
+              }
+
+              Write-Host "Upload URL: $addUrl"
+              Write-Host "Binary: $binPath"
+
+              # Param JSON string requerido por addApp (appName + modelName)
+              $paramObj = @{
+                appName   = "${{ parameters.appName }}"
+                modelName = "${{ parameters.modelName }}"
+              }
+              $paramJson = ($paramObj | ConvertTo-Json -Compress)
+
+              $headers = @{ Authorization = "$(TMS_TOKEN)" }   
+              $resp = Invoke-RestMethod -Method Post -Uri $addUrl -Headers $headers -Form @{
+                file  = Get-Item $binPath
+                param = $paramJson
+              }
+
+              # si el response tiene appId, se guarda como variable para usar en publish. Si no, se resuelve con queryPageList.
+              if ($resp.appId) {
+                Write-Host "##vso[task.setvariable variable=TMS_APP_ID]$($resp.appId)"
+                Write-Host " addApp OK → appId: $($resp.appId)"
+              } else {
+                Write-Host " addApp response had no appId; will resolve via queryPageList" 
+              }
+            displayName: "TMS addApp (upload app.bin)"
+
+          # 4) queryPageList: encontrar id del app recién subido (si no vino appId)
+          - pwsh: |
+              $ErrorActionPreference = "Stop"
+
+              if ("$(TMS_APP_ID)" -and "$(TMS_APP_ID)" -ne "") {
+                Write-Host " TMS_APP_ID already set: $(TMS_APP_ID). Skipping query."
+                exit 0
+              }
+
+              $queryUrl = "${{ parameters.tmsBaseUrl }}${{ parameters.queryPath }}"
+              Write-Host "Query URL: $queryUrl"
+
+              $headers = @{
+                Authorization = "$(TMS_TOKEN)"
+                "Content-Type" = "application/json"
+              }
+
+              # Búsqueda por appName (paginación básica)
+              $bodyObj = @{
+                appName  = "${{ parameters.appName }}"
+                pageNum  = 1
+                pageSize = 10
+              }
+              $body = $bodyObj | ConvertTo-Json -Compress
+
+              $resp = Invoke-RestMethod -Method Post -Uri $queryUrl -Headers $headers -Body $body
+
+      
+              $items = @()
+              if ($resp.data -and $resp.data.list) { $items = $resp.data.list }
+              elseif ($resp.data -is [System.Array]) { $items = $resp.data }
+              elseif ($resp.data) { $items = @($resp.data) }
+
+              if (-not $items -or $items.Count -eq 0) {
+                throw "queryPageList returned no items for appName='${{ parameters.appName }}'"
+              }
+
+              # aqui hacemos match por appName + modelName para encontrar el registro correcto del app subido, y obtener su id/appId. Si no hay match exacto, hacemos fallback a buscar solo por appName
+              $match = $items | Where-Object { $_.appName -eq "${{ parameters.appName }}" -and $_.modelName -eq "${{ parameters.modelName }}" } | Select-Object -First 1
+              if (-not $match) {
+                # fallback: solo por appName
+                $match = $items | Where-Object { $_.appName -eq "${{ parameters.appName }}" } | Select-Object -First 1
+              }
+
+              if (-not $match) {
+                throw "Could not resolve app record in queryPageList."
+              }
+
+              # Algunos retornan id, otros appId. Guardamos ambos si existen.
+              if ($match.id) {
+                Write-Host "##vso[task.setvariable variable=TMS_APP_ID]$($match.id)"
+                Write-Host " Resolved TMS_APP_ID via id: $($match.id)"
+              } elseif ($match.appId) {
+                Write-Host "##vso[task.setvariable variable=TMS_APP_ID]$($match.appId)"
+                Write-Host " Resolved TMS_APP_ID via appId: $($match.appId)"
+              } else {
+                throw "queryPageList match had no id/appId field."
+              }
+            displayName: "Resolve App ID (queryPageList)"
+
+          # 5) upAndDownApp: publicar (on shelves) o retirar
+          - pwsh: |
+              $ErrorActionPreference = "Stop"
+
+              $publishUrl = "${{ parameters.tmsBaseUrl }}${{ parameters.publishPath }}"
+              Write-Host "Publish URL: $publishUrl"
+              Write-Host "Using TMS_APP_ID: $(TMS_APP_ID)"
+
+              if (-not "$(TMS_APP_ID)" -or "$(TMS_APP_ID)" -eq "") {
+                throw "TMS_APP_ID is empty; cannot publish."
+              }
+
+              $headers = @{
+                Authorization = "$(TMS_TOKEN)"
+                "Content-Type" = "application/json"
+              }
+
+              # Body según OpenAPI: id/type/otaType/pushRange...
+              # este bloque construye el cuerpo de la solicitud para el endpoint upAndDownApp del TMS, que se utiliza para publicar (on shelves) o retirar una aplicación. El cuerpo incluye el id de la app (TMS_APP_ID), el tipo de operación (publicar o retirar), el tipo de OTA, el rango de push, y otros campos requeridos por la API. Luego convierte este objeto a JSON para enviarlo en la solicitud POST.
+              $bodyObj = @{
+                id         = "$(TMS_APP_ID)"
+                type       = [int]"${{ parameters.upOrDownType }}"   # 1 publish, 2 removal
+                otaType    = [int]"${{ parameters.otaType }}"
+                pushRange  = [int]"${{ parameters.pushRange }}"
+                pushDate   = ""
+                pushObject = ""
+                taskGroupId = @()
+                unShelveDate = ""
+              }
+
+              $body = $bodyObj | ConvertTo-Json -Compress
+
+              $resp = Invoke-RestMethod -Method Post -Uri $publishUrl -Headers $headers -Body $body
+              Write-Host " upAndDownApp executed. (Publish/remove request sent)"
+            displayName: "TMS upAndDownApp (publish/remove)"

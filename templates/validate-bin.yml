@@ -1,0 +1,49 @@
+# ============================================================
+# Template: validate-bin.yml
+#
+# Este template valida el binario ANTES de publicarlo/desplegarlo:
+#  1) Si existe
+#  2) Tamaño razonable (>=10KB) (verifical el tamaño esperado para el .bin especifico para ajustar esto)
+#  3) Calcula SHA256 para trazabilidad
+#
+# Guarda SHA como variable del pipeline:
+#  APP_BIN_SHA256 el SHA256 se hace disponible como variable de pipeline para stages posteriores, lo que permite que los logs de despliegue incluyan esta información para auditoría y diagnóstico. Esto es útil por si se necesita verificar la integridad del binario durante el despliegue o comparar con versiones anteriores.
+# ============================================================
+
+parameters:
+  - name: appBin
+    type: string
+
+steps:
+  - pwsh: | 
+      $ErrorActionPreference = "Stop"
+      $bin = "${{ parameters.appBin }}" 
+
+      Write-Host "── Validating artifact: $bin ──"
+
+      # 1) Existe
+      if (-not (Test-Path $bin)) {
+        throw "Artifact not found: $bin"
+      }
+      Write-Host " File exists: $bin"
+
+      # 2) Tamaño razonable (>=10KB) # cambiarlo si se necesita 
+      $size = (Get-Item $bin).Length
+      $sizeKB = [math]::Round($size / 1024, 2)
+      if ($size -lt 10240) {
+        throw "Artifact too small ($sizeKB KB). Possibly corrupt/incomplete."
+      }
+      Write-Host " Size OK: $sizeKB KB"
+
+      # 3) SHA256
+      # este bloque calcula el hash SHA256 del archivo binario usando Get-FileHash, lo que proporciona una forma de verificar la integridad del archivo. El hash se muestra en los logs para trazabilidad, y también se exporta como variable de pipeline (APP_BIN_SHA256) para que esté disponible en etapas posteriores del pipeline, lo que es útil para auditoría y diagnóstico durante el proceso de despliegue.
+      
+      $hash = (Get-FileHash $bin -Algorithm SHA256).Hash
+      Write-Host " SHA256: $hash"
+
+      # Exporta variable para siguientes stages (útil para logs/auditoría)
+      Write-Host "##vso[task.setvariable variable=APP_BIN_SHA256]$hash"
+
+      Write-Host "── Validation complete ──"
+    displayName: "Validate app.bin (exists/size/SHA256)"
+    

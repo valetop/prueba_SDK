@@ -1,0 +1,65 @@
+# ============================================================
+# Template: install-tools.yml
+#
+# Este template instala herramientas necesarias para build.bat del SDK:
+#  - Node.js (para npm / TypeScript build)
+#  - npm install (dependencias)
+#  - Python (para scripts .py: update_res.py es para , pack_res.py, etc.)
+#  - SCons (para build de librerías nativas / AWTK )
+#
+# Nota: La documentación pide Node >= 16.x.
+# La propuesta es usar 18.x por estabilidad. Si hay incompatibilidad, se cambia a 16.x.
+# ============================================================
+
+steps:
+  # ------------------------------
+  # Node.js (18.x por estabilidad)
+  # ------------------------------
+  - task: NodeTool@0
+    displayName: "Install Node.js (18.x recommended; switch to 16.x if build.bat has issues)"
+    inputs:
+      versionSpec: "18.x"
+
+  # Opción de usar 16.x por compatibilidad:
+  # - task: NodeTool@0
+  #   displayName: "Install Node.js 16.x"
+  #   inputs:
+  #     versionSpec: "16.x"
+
+  # ------------------------------
+  # npm install (dependencias)
+  # ------------------------------
+  - script: npm install # esto instala las dependencias de Node.js necesarias para el build, como TypeScript, que es requerido por build.bat. Necesariamente luego de instalar Node.js
+    displayName: "npm install (project dependencies)"
+
+  # ------------------------------
+  # Python (>=3.5 mínimo, 3.11 recomendado)
+  # ------------------------------
+  - task: UsePythonVersion@0
+    displayName: "Install Python (3.11)"
+    inputs:
+      versionSpec: "3.11"
+      addToPath: true
+
+  # ------------------------------
+  # SCons (instalación por pip)
+  # ------------------------------
+  - pwsh: |
+      $ErrorActionPreference = "Stop"
+      python -m pip install --upgrade pip
+      python -m pip install scons
+    displayName: "Install SCons (pip)"
+
+  # ------------------------------
+  # Verificación de versiones (log)
+  # ------------------------------
+  - pwsh: | #Este paso es solo para verificar que las herramientas se instalaron correctamente y mostrar sus versiones en los logs, lo cual es útil para debugging y trazabilidad y ayuda a identificar si alguna herramienta no se instaló o si hay versiones incompatibles.
+      Write-Host "========================================"
+      Write-Host " Build environment versions"
+      Write-Host "========================================"
+      node --version
+      npm --version
+      python --version
+      scons --version
+      Write-Host "========================================"
+    displayName: "Verify tool versions"

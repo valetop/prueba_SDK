@@ -1,0 +1,165 @@
+# ============================================================
+# Pipeline: miniPOS (CI + CD) — Build + Deploy (DEV/UAT/PDN)
+#
+# Qué hace:
+#  1) Build: instala herramientas -> corre build.bat -> valida app.bin -> publica artefacto
+#  2) Deploy DEV: descarga artefacto -> login TMS -> addApp -> queryPageList -> upAndDownApp
+#  3) Deploy UAT: igual que DEV
+#  4) Deploy PDN: solo corre si el run viene por tag v* + (aprobación en Environment tms-pdn)
+#
+# IMPORTANTE:
+#  - Las aprobaciones NO van aquí; se configuran en Azure DevOps > Environments (Ya esta definida)
+#  - Secretos NO van aquí se configuran en Variable Groups (Library) en azure 
+# ============================================================
+
+name: miniPOS-$(Build.SourceBranchName)-$(Build.BuildId)  # Esto define el formato del nombre de cada build, incluyendo el nombre de la rama y un ID único. Esto ayuda a identificar fácilmente el origen de cada build (por ejemplo, si viene de main, una rama de feature, o un tag) y a mantener un historial organizado de las builds realizadas.
+
+trigger:
+  branches:
+    include:
+      - main
+  tags:
+    include:
+      - v*
+
+pr:
+  branches:
+    include:
+      - main
+
+# ------------------------------------------------------------
+# Variable group NO-secreto
+# ------------------------------------------------------------
+variables:
+  - group: tms-config # Este es el grupo de variables para configuración común (URLs, paths, nombres, etc.) que se creo en Library > Variable groups. No debe contener secretos, solo datos de configuración que pueden ser públicos.
+
+  # Defaults (se cambia por los valores que necesitemos)
+  - name: APP_BIN
+    value: "app.bin"
+  - name: ARTIFACT_NAME
+    value: "app-bin"
+
+stages:
+# ============================================================
+# STAGE 1: BUILD
+# ============================================================
+- stage: Build # Esta etapa se encarga de compilar el proyecto y validar el binario antes de publicarlo como artefacto. Es independiente de los despliegues, para que los stages de Deploy usen el mismo binario sin recompilar. y se guarda en Azure Artifacts para trazabilidad.
+  displayName: "Build → Validate → Publish app.bin"
+  jobs:
+  - job: build_validate_publish
+    displayName: "Build/Validate/Publish"
+    pool:
+      vmImage: "windows-latest" #Se necesita Windows para build.bat; si en el futuro hay build multiplataforma, se puede ajustar esto.
+    steps:
+      - checkout: self 
+        clean: 'true' # el true debe ser string porque es un parámetro de la tarea checkout. Esto asegura que el repositorio se limpie antes de cada build, eliminando cualquier archivo generado en builds anteriores que pueda interferir con el proceso actual. Es una buena práctica para evitar problemas de artefactos residuales y asegurar que cada build parte de un estado limpio del código. 
+        # aqui limpiamos el repo para evitar artefactos residuales que puedan interferir con el build o la validación. Esto asegura que cada build parte de un estado limpio del código, lo que mejora la confiabilidad y reproducibilidad del proceso.
+
+      # 1) Instalar herramientas necesarias para que build.bat funcione
+      - template: templates/install-tools.yml
+
+      # 2) Ejecutar build oficial del SDK (produce app.bin)
+      - script: |
+          call build.bat
+        displayName: "Run build.bat → genera app.bin"
+
+      # 3) Validar el binario antes de publicarlo (existencia, tamaño, hash)
+      - template: templates/validate-bin.yml
+        parameters:
+          appBin: "$(APP_BIN)" #Esto es para validar que el app.bin se generó correctamente y cumple con ciertos criterios (no está corrupto, tiene el tamaño esperado, etc.) antes de publicarlo como artefacto. Esto ayuda a evitar que stages posteriores de Deploy usen un binario inválido, lo que podría causar fallos difíciles de diagnosticar en etapas de despliegue.
+
+      # 4) Publicar artefacto para que los stages de Deploy NO recompilen
+      - publish: "$(APP_BIN)" # Publicamos el app.bin generado como artefacto con el nombre definido en ARTIFACT_NAME. Esto permite que los stages de Deploy descarguen exactamente el mismo binario que se construyó y validó, asegurando consistencia entre build y deploy.
+        artifact: "$(ARTIFACT_NAME)"
+        displayName: "Publish artifact: $(ARTIFACT_NAME)"
+
+# ============================================================
+# STAGE 2: DEPLOY DEV
+# ============================================================
+- stage: Deploy_DEV
+  displayName: "Deploy → DEV"
+  dependsOn: Build
+  condition: succeeded()
+  variables:
+    # Secrets por ambiente (son iguales, pero es bueno separarlos)
+    - group: tms-dev-secrets
+  jobs:
+    - template: templates/tms-deploy.yml
+      parameters:
+        environmentName: "tms-dev"           # Environment en Azure DevOps
+        artifactName: "$(ARTIFACT_NAME)"
+        appBinName: "$(APP_BIN)"
+        tmsBaseUrl: "$(TMS_BASE_URL)"
+        loginPath: "$(TMS_LOGIN_PATH)"
+        addAppPath: "$(TMS_ADD_APP_PATH)"
+        queryPath: "$(TMS_QUERY_PATH)"
+        publishPath: "$(TMS_PUBLISH_PATH)"
+        tmsUsername: "$(TMS_USERNAME)"
+        tmsPasswordMd5: "$(TMS_PASSWORD_MD5)"
+        appName: "$(TMS_APP_NAME)"
+        modelName: "$(TMS_MODEL_NAME)"       # M3S
+        # DEV: group (3) + manual (0) para laboratorio/canary 
+        # Rollout significa que se va liberando a grupos de dispositivos progresivamente, y manual (0) es típico para etapas tempranas donde se quiere controlar el despliegue a mano. En este caso, al ser DEV, se sugiere usar group 3 (que podría ser un grupo de prueba interno) y manual (0) para tener control total sobre cuándo se libera a ese grupo.
+        pushRange: 3
+        otaType: 0 # con el 0 aseguramos que el despliegue se haga como "manual" es decir, en el TMS se verá como un despliegue que no se activa automáticamente, sino que queda listo para ser activado manualmente por el equipo, lo cual es ideal para entornos de desarrollo donde se quiere tener control total sobre cuándo se libera a los dispositivos de prueba.
+        upOrDownType: 1
+
+# ============================================================
+# STAGE 3: DEPLOY UAT
+# ============================================================
+- stage: Deploy_UAT
+  displayName: "Deploy → UAT"
+  dependsOn: Deploy_DEV
+  condition: succeeded()
+  variables:
+    - group: tms-uat-secrets
+  jobs:
+    - template: templates/tms-deploy.yml
+      parameters:
+        environmentName: "tms-uat"
+        artifactName: "$(ARTIFACT_NAME)"
+        appBinName: "$(APP_BIN)"
+        tmsBaseUrl: "$(TMS_BASE_URL)"
+        loginPath: "$(TMS_LOGIN_PATH)"
+        addAppPath: "$(TMS_ADD_APP_PATH)"
+        queryPath: "$(TMS_QUERY_PATH)"
+        publishPath: "$(TMS_PUBLISH_PATH)"
+        tmsUsername: "$(TMS_USERNAME)"
+        tmsPasswordMd5: "$(TMS_PASSWORD_MD5)"
+        appName: "$(TMS_APP_NAME)"
+        modelName: "$(TMS_MODEL_NAME)"
+        # UAT: group (3) y (0/1); aqui manual (0)
+        pushRange: 3
+        otaType: 0
+        upOrDownType: 1
+
+# ============================================================
+# STAGE 4: DEPLOY PDN (solo tags v* para producción)
+# ============================================================
+- stage: Deploy_PDN
+  displayName: "Deploy → PDN"
+  dependsOn: Deploy_UAT
+  # Solo corre si el run viene de tag v*
+  # Tag v* es la convención típica para marcar releases en Git, y al usar esta condición, nos aseguramos de que el despliegue a PDN solo ocurra cuando se cree un tag que siga esta convención, lo que generalmente indica que es una versión lista para producción. Esto ayuda a prevenir despliegues accidentales a PDN desde ramas de desarrollo o PRs.
+  condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v')) # esta linea asegura que este stage solo se ejecute si el build fue disparado por un tag que comienza con "v", lo cual es una práctica común para marcar versiones de producción. Esto añade una capa de seguridad para evitar despliegues accidentales a PDN desde ramas de desarrollo o PRs, asegurando que solo las versiones oficialmente etiquetadas sean desplegadas a producción.
+  variables:
+    - group: tms-pdn-secrets
+  jobs:
+    - template: templates/tms-deploy.yml
+      parameters:
+        environmentName: "tms-pdn"
+        artifactName: "$(ARTIFACT_NAME)"
+        appBinName: "$(APP_BIN)"
+        tmsBaseUrl: "$(TMS_BASE_URL)"
+        loginPath: "$(TMS_LOGIN_PATH)"
+        addAppPath: "$(TMS_ADD_APP_PATH)"
+        queryPath: "$(TMS_QUERY_PATH)"
+        publishPath: "$(TMS_PUBLISH_PATH)"
+        tmsUsername: "$(TMS_USERNAME)"
+        tmsPasswordMd5: "$(TMS_PASSWORD_MD5)"
+        appName: "$(TMS_APP_NAME)"
+        modelName: "$(TMS_MODEL_NAME)"
+        # PROD: all devices (1) + forced (1) para producción
+        pushRange: 1
+        otaType: 1
+        upOrDownType: 1
